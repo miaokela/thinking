@@ -442,12 +442,137 @@ for i := 0; i < 3; i++ {
 
 ### 🔄 调度循环：工人们怎么被分配活？
 
-工头（P）循环：从自己的待办队列取一个工人（G）→ 送到工位（M）上干活 → 工人干完/卡住了 → 换下一个。
+M 启动 → `mstart1()` → `schedule()` → 循环。每次 `schedule()` 都要找一个可运行的 G：
 
-工人从哪来？优先级：
-1. **自己的待办队列**（99% 的情况）
-2. **全局队列**（每 61 次调度查一次，防止某些工人饿死）
-3. **偷别人的**（work stealing）：自己的队列空了，随机找一个工头，偷走他一半的工人
+```
+┌─────────────────────────────────────────────────┐
+│              schedule() 查找 G 的顺序              │
+├─────────────────────────────────────────────────┤
+│                                                 │
+│  ① 每 61 次调度 → 优先查全局队列                    │
+│     ↓ (没找到 or 不该查)                          │
+│  ② 查本地队列 runnext（最高优先级，刚放进去的）       │
+│     ↓ (没有)                                     │
+│  ③ 查本地队列 runq（环形队列，FIFO）               │
+│     ↓ (没有)                                     │
+│  ④ 再查一次全局队列（兜底）                         │
+│     ↓ (没有)                                     │
+│  ⑤ 从 netpoll 拿（网络 IO 就绪的 G）               │
+│     ↓ (没有)                                     │
+│  ⑥ work stealing（随机偷别的 P 一半）              │
+│     ↓ (没有)                                     │
+│  ⑦ 再查全局队列（最后机会）                         │
+│     ↓ (没有)                                     │
+│  ⑧ 进入休眠（stopm），等被唤醒                      │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+每一步的源码逻辑：
+
+**① 每 61 次调度查全局队列**——防止全局队列饿死：
+
+```go
+// schedule() 开头
+if schedtick%61 == 0 && sched.runqsize > 0 {
+    lock(&sched.lock)
+    gp := globrunqget(pp, 1)  // 从全局队列取一个 G
+    unlock(&sched.lock)
+    if gp != nil { return gp, false }
+}
+```
+
+为什么是 61？61 是质数，和调度计数器（256、255）互质，避免周期性冲突，本质是用概率保证公平。全局队列是动态增长的环形链表，通过 `sched.runqhead` / `sched.runqtail` 操作。
+
+**② runnext**（最高优先级，单 G 槽位）：
+
+```go
+next := pp.runnext
+if next != 0 && pp.runnext.cas(next, 0) {
+    return next.ptr(), true  // 继承时间片
+}
+```
+
+新创建的 goroutine 优先放这里——刚创建的 G 数据还热乎（cache locality）。
+
+**③ 本地队列 runq**（无锁环形数组，容量 256）：
+
+```go
+h := atomic.LoadAcq(&pp.runqhead)
+t := pp.runqtail
+if t == h { return nil, false }        // 空
+gp := pp.runq[h%256].ptr()
+atomic.CasRel(&pp.runqhead, h, h+1)    // 原子操作，无锁
+return gp, false
+```
+
+**④⑦ 全局队列兜底**：`globrunqget(pp, 0)` 从 `sched.runq` 链表头取 G。
+
+**⑤ netpoll**（非阻塞检查 epoll/kqueue，只拿已就绪的 G）：
+
+```go
+list, delta := netpoll(0)  // 非阻塞
+if !list.empty() {
+    injectglist(&list)     // 放入全局队列
+}
+```
+
+**⑥ Work Stealing**——随机偷别的 P：
+
+```go
+// 用互质数保证遍历顺序伪随机，避免所有 P 偷同一个
+for i := 0; i < 4; i++ {
+    for enum := (uint32)(pp.id) + 1; ; {
+        p2 := allp[enum%gomaxprocs]
+        enum++
+        if p2.status == _Prunning {
+            gp := runqsteal(pp, p2, stealRunNextG)  // 偷一半
+            if gp != nil { return gp }
+        }
+    }
+}
+```
+
+偷的策略：随机选 P → 偷**一半**（给对方留点）→ 会偷 runnext。
+
+**⑧ stopm**（所有来源都没找到 G → 线程休眠，等被唤醒后重新 schedule）。
+
+### 📥 新 G 从哪进队列？
+
+```go
+go f()
+    │
+    ▼
+runqput(pp, gp, next)
+    │
+    ├── next=true  → 放 runnext（单槽位）
+    │
+    └── next=false → 放本地队列 runq[256]
+                          │
+                          └── 本地队列满了（256）
+                                │
+                                ▼
+                          runqputslow()
+                          取出本地队列一半 + 新 G
+                          加锁后批量放入全局队列
+```
+
+```go
+func runqputslow(pp *p, gp *g, h, t uint32) bool {
+    var batch [64]*g
+    n := (t - h) / 2
+    for i := n; i < 128; i++ {
+        batch[i] = pp.runq[(h+i)%256].ptr()
+    }
+    batch[n] = gp
+    lock(&sched.lock)
+    globrunqputbatch(&batch[0], int32(n+1))  // 批量放入全局队列
+    unlock(&sched.lock)
+    return true
+}
+```
+
+**核心设计思想**：本地优先（无锁快），全局兜底（61 次检查防饿死），随机偷取（负载均衡），三级漏斗逐层过滤。
 
 ### 🚧 卡住了怎么办？—— Go 并发高效的真正秘密
 
@@ -775,25 +900,150 @@ Go 能做这种事是因为它是**精确 GC 语言**——运行时知道栈上
 
 ## 20. reflect：类型系统暴露给运行时
 
-### 🎯 一句话：反射是"拆信封"——把接口信封里的类型标签和数据拿出来看
+### 🎯 一句话：反射 = 运行时拆开"信封"，看里面是什么类型、什么数据
 
 ```go
-t := reflect.TypeOf(x)   // 看信封上的标签：你是什么类型？
-v := reflect.ValueOf(x)  // 打开信封：里面的数据是什么？
+func main() {
+    var x float64 = 3.14
+
+    // 信封上写着 "float64"，里面装着 3.14
+    t := reflect.TypeOf(x)   // 拿到类型信息："float64"
+    v := reflect.ValueOf(x)  // 拿到值：3.14
+    fmt.Println(t)           // float64
+    fmt.Println(v)           // 3.14
+    fmt.Println(v.Float())   // 3.14（用类型对应的方法取值）
+}
 ```
 
-### 📜 三条定律
+### 🔬 TypeOf 和 ValueOf 返回了什么？
 
-1. **interface → reflect**：`TypeOf/ValueOf` 拆开信封，暴露 (类型, 数据)。
-2. **reflect → interface**：`Value.Interface()` 把信封重新封好。
-3. **要修改，必须可寻址 + 传入指针**：`reflect.ValueOf(&x).Elem().SetInt(9)`——因为反射拿到的是**拷贝**，只有 `.Elem()` 解引用到原始内存才可写。
+`interface{}` 内部是两个东西：`(_type, data)`。反射就是拆开这个信封：
+
+```
+interface{} = (_type, data)
+     │
+     ├─ TypeOf  → 只拿 _type
+     │             → 返回 reflect.Type（接口，内部是 *rtype）
+     │             → 能查：类型名、大小、字段数、方法列表
+     │
+     └─ ValueOf → 拿 _type + data
+                   → 返回 reflect.Value（结构体）
+                   → 里有：typ_（类型）、ptr（数据指针）、flag（权限）
+                   → 能读写实际数据
+```
+
+```go
+// rtype 的核心字段（简化）
+type rtype struct {
+    size    uintptr                // 类型占多少字节（float64 = 8）
+    kind    uint8                  // 种类：float64, int, struct, ptr...
+    equal   func(a, b unsafe.Pointer) bool  // 比较函数
+}
+
+// Value 的核心字段
+type Value struct {
+    typ_ *abi.Type   // 类型信息（指向 rtype）
+    ptr  unsafe.Pointer  // 指向实际数据的指针
+    flag flag         // 是否可导出、是否可寻址
+}
+```
+
+| | TypeOf 返回 | ValueOf 返回 |
+|---|---|---|
+| 类型 | `reflect.Type`（接口） | `reflect.Value`（结构体） |
+| 内含 | `*rtype`（类型元数据） | `typ_` + `ptr` + `flag` |
+| 能干什么 | 查类型：`Kind()`, `Name()`, `NumField()` | 读写数据：`Int()`, `Float()`, `SetInt()` |
+
+### 🔧 反射能干什么？——动态操作值
+
+**场景 1：不知道类型，但要读取值**
+
+```go
+func printAny(x interface{}) {
+    v := reflect.ValueOf(x)
+    switch v.Kind() {  // Kind = 底层种类（Int, Float, Struct, Ptr...）
+    case reflect.Int:
+        fmt.Println("整数：", v.Int())
+    case reflect.Float64:
+        fmt.Println("小数：", v.Float())
+    case reflect.String:
+        fmt.Println("字符串：", v.String())
+    }
+}
+
+printAny(42)        // 整数：42
+printAny("hello")   // 字符串：hello
+```
+
+**场景 2：遍历结构体字段（JSON 序列化的原理）**
+
+```go
+type User struct {
+    Name string `json:"name"`
+    Age  int    `json:"age"`
+}
+
+u := User{"张三", 25}
+v := reflect.ValueOf(u)
+t := v.Type()  // 拿到类型信息
+
+for i := 0; i < t.NumField(); i++ {
+    field := t.Field(i)       // 字段的类型信息
+    value := v.Field(i)       // 字段的值
+    tag := field.Tag.Get("json")  // 拿到 json tag
+    fmt.Printf("%s(%s) = %v\n", field.Name, tag, value)
+}
+// Name(name) = 张三
+// Age(age) = 25
+```
+
+### ⚠️ 反射的坑：为什么传指针才能修改值？
+
+```go
+// ❌ 修改失败
+x := 10
+v := reflect.ValueOf(x)  // 拿到的是 x 的拷贝
+v.SetInt(20)              // panic！SetInt on unaddressable value
+
+// ✅ 修改成功
+x := 10
+v := reflect.ValueOf(&x)  // 传指针
+v.Elem().SetInt(20)       // .Elem() 解引用，拿到 x 本身
+fmt.Println(x)            // 20 ✓
+```
+
+为什么？
+
+```
+reflect.ValueOf(x)  → 拿到 x 的拷贝，修改拷贝没意义
+reflect.ValueOf(&x) → 拿到 x 的地址
+    .Elem()          → 解引用，指向 x 本身
+    .SetInt(20)      → 直接修改 x 的内存
+```
+
+**类比**：反射拿到的是"照片"，只能看不能改。传指针拿到的是"原件的地址"，才能改。
+
+### 📋 反射速查表
+
+| 你想干什么 | 怎么做 |
+|---|---|
+| 拿类型 | `reflect.TypeOf(x)` |
+| 拿值 | `reflect.ValueOf(x)` |
+| 读整数 | `v.Int()` |
+| 读小数 | `v.Float()` |
+| 读字符串 | `v.String()` |
+| 读结构体字段数 | `v.NumField()` |
+| 读第 i 个字段 | `v.Field(i)` |
+| 读字段的 tag | `t.Field(i).Tag.Get("json")` |
+| 修改值 | 传指针 → `.Elem().SetXxx()` |
+| 判断类型 | `v.Kind() == reflect.Int` |
 
 ### 💸 代价
 
-- 装箱分配 + 间接调用 + 失去编译期类型检查（错误推迟到运行时 panic）。
-- **序列化框架的热路径**都是"反射一次、生成/缓存访问器、之后直跑"（jsoniter、easyjson 干脆代码生成）。
-- `reflect.StructTag` 只是字符串约定，解析靠各框架——tag 没有语言级语义。
-- 不可导出字段可以被读到，但 `Set` 会 panic。序列化库遇到私有字段直接跳过是正解。
+- **装箱分配**：值进入 interface{} 会分配内存。
+- **间接调用**：反射调用比直接调用慢 10-100 倍。
+- **失去编译检查**：类型错误推迟到运行时 panic（比如对字符串调 `v.Int()`）。
+- **序列化框架的做法**：反射一次，缓存访问器，之后直跑（jsoniter、easyjson 干脆代码生成）。
 
 **零 reflect.Value（`reflect.Value{}`）调任何方法都 panic**——先检查 `IsValid()`。
 
