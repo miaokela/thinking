@@ -82,10 +82,98 @@ JNI callStaticObjectMethod not implemented  class: com/example/H5Utils  method: 
 ```
 > 特点：既有系统类（Build）回调，又有**App 自定义 Java 类**回调——后者需要你从 jadx 反编译里复制并重写那段 Java 逻辑。
 
-### 5. 补齐环境
-- 系统类：补 `callObjectMethodV`/`callStaticObjectMethodV`
-- **App 自定义类**：反编译 `H5Utils.getSign` 的 Java 逻辑，在 `AbstractJni` 里用 JDK 类（`StringBuilder`/`HashMap`）重现返回值
-- 工程量大时用 **JniForward**（转发到真实 ART）省掉大部分 override
+### 5. 补齐环境（逐个报错补）
+
+原则：**让 SO 跑起来，报什么错就重写哪个回调**。下面两条报错分别对应**实例方法**和**静态方法**的回调。
+
+#### 5.1 补 `android/os/Build#getSerial()`（实例方法回调）
+
+报错：
+```
+JNI callObjectMethod not implemented  class: android/os/Build  method: getSerial()Ljava/lang/String;
+```
+`callObjectMethod` 是**实例方法**，重写 `callObjectMethodV`：
+
+```java
+@Override
+public DvmObject<?> callObjectMethodV(VM vm, DvmObject<?> obj,
+        String name, String signature, VaList vaList) {
+
+    // 命中 android.os.Build.getSerial()，返回一个固定序列号
+    if ("android/os/Build".equals(obj.getObjectClass().getName())
+            && "getSerial".equals(name)) {
+        return new StringObject(vm, "1234567890abcdef");
+    }
+    return super.callObjectMethodV(vm, obj, name, signature, vaList);
+}
+```
+
+> 注意：`Build.getSerial()` 官方是 **static** 方法，正常情况下会走 `callStaticObjectMethodV`；但当 SO 通过 `jobject`（实例/对象指针）去调用它时，unidbg 会把它路由到 `callObjectMethodV`。**关键是根据实际报错走哪个回调就重写哪个**，别死记"它该是静态"。
+
+如果你跑出来它实际走的是 `callStaticObjectMethodV`，就改为：
+
+```java
+@Override
+public DvmObject<?> callStaticObjectMethodV(VM vm, DvmClass dvmClass,
+        String name, String signature, VaList vaList) {
+    if ("android/os/Build".equals(dvmClass.getName()) && "getSerial".equals(name)) {
+        return new StringObject(vm, "1234567890abcdef");
+    }
+    return super.callStaticObjectMethodV(vm, dvmClass, name, signature, vaList);
+}
+```
+
+#### 5.2 补 `com/example/H5Utils#getSign(...)`（App 自定义类，静态方法）
+
+报错：
+```
+JNI callStaticObjectMethod not implemented  class: com/example/H5Utils  method: getSign(...)
+```
+这类是**业务自定义类**，unidbg 完全没有实现，必须**从 jadx 反编译里还原逻辑**。它返回的是 String，所以重写 `callStaticObjectMethodV`：
+
+```java
+@Override
+public DvmObject<?> callStaticObjectMethodV(VM vm, DvmClass dvmClass,
+        String name, String signature, VaList vaList) {
+
+    if ("com/example/H5Utils".equals(dvmClass.getName()) && "getSign".equals(name)) {
+
+        // 1) 从 vaList 读取入参（顺序、类型与方法签名一一对应）
+        DvmObject<?> p0 = vaList.getObjectArg(0);      // 例：字符串参数
+        DvmObject<?> p1 = vaList.getObjectArg(1);      // 例：对象参数
+        String a = (String) p0.getValue();
+        // ... 按需取其他参数
+
+        // 2) 这里写从 JADX 里还原回来的真实 Java 逻辑
+        //    例如：对参数做拼接、取 hash、再进 AES 等
+        String sign = reproduceSign(a, dvmClass, vm);
+
+        // 3) 返回 String，用 new StringObject 包装
+        return new StringObject(vm, sign);
+    }
+    return super.callStaticObjectMethodV(vm, dvmClass, name, signature, vaList);
+}
+
+// 在 AbstractJni 子类里，用 JDK 类重现 H5Utils.getSign 的实现
+private String reproduceSign(String input, DvmClass dvmClass, VM vm) {
+    // 示例：按真实逻辑还原，这里只是示意
+    // 实际是从 jadx 复制的 Java 代码（可用 StringBuilder / HashMap / Cipher 等 JDK 类）
+    StringBuilder sb = new StringBuilder(input);
+    sb.reverse();
+    return sb.toString();   // 换成真实算法
+}
+```
+
+**要点**：
+- 返回 String → `new StringObject(vm, value)`；返回 int → `DvmInteger.valueOf(vm, value)`；返回 `byte[]` → `new ByteArray(vm, bytes)`。
+- **入参读取**：`vaList.getObjectArg(i)`（对象）、`vaList.getIntArg(i)`（int）、`vaList.getLongArg(i)`（long）；参数顺序跟 `getSign(...)` 签名一致。
+- **还原方式**：把 jadx 里 `H5Utils.getSign` 的 Java 源码"翻译"成上面 `reproduceSign` 的普通 Java 代码即可，不用理解 so。
+- 若该方法还调用**其它 App 自定义类**，会继续报 `callXxx not implemented`，接着把那些类也这样补——**报一个补一个**。
+
+#### 5.3 补不动时的退路
+
+- 回调太深、业务类太多 → 改用 **JniForward**，把 unidbg 的 JNI 转发到真实 ART，省掉大量 override。
+- 仍很麻烦 → **Frida + 真机**直接 hook，别硬啃 unidbg。
 
 ### 6. 打包
 同前 Maven 结构，另需把 `libsgmain` 的依赖 so 也放进 resources。
